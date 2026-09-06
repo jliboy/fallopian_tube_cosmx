@@ -1,0 +1,400 @@
+---
+title: "CosMx SMI Data Analysis"
+output: github_document
+autor : "Jose Liboy-Lugo"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading required packages and variables
+
+```{r load-packages}
+#usethis::edit_r_environ("project") #Set the environment variables for the project.
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(data.table)
+library(ggrepel)
+
+date <- Sys.Date()
+source(here::here("src", "spatial_uproc.R"))
+source(here::here("src", "spatial_qc.R"))
+source(here::here("src", "spatial_dproc.R"))
+                         
+COSMX_INPUTFILES_REPO        <- Sys.getenv("input_path")
+COSMX_OUTPUTFILES_REPO       <- Sys.getenv("output_path")
+PANEL_FOV                    <- "Hs_UCC"
+PANEL_PLEX                   <- 1000
+NEG_PANEL_PLEX               <- 10
+FOV_MAX_PROP_LOSS            <- 0.6
+
+# QC thresholds
+COUNTS_THRESHOLD_MIN          <- 20
+COUNTS_THRESHOLD_MAX          <- NULL
+AREA_THRESHOLD_MIN            <- NULL
+AREA_THRESHOLD_MAX            <- 60e3
+SBR_THRESHOLD_MIN             <- 0
+SBR_THRESHOLD_MAX             <- NULL
+FOV_INTEGRITY_PERCENT_THRESHOLD <- 0.6
+SPLIT_RATIO_THRESHOLD_MIN     <- NULL
+SPLIT_RATIO_THRESHOLD_MAX     <- log2(4)
+
+options(future.globals.maxSize = 30 * 1024^3) #Set the maximum allowed RAM memory to x * 1024^3 = xGB
+
+```
+
+## Loading CosMx seurat objects
+
+``` {r load-seurat-objects}
+
+obj <- readCosMxSeurat(experiment_repo = COSMX_INPUTFILES_REPO)
+obj
+
+```
+
+## Plotting FOV QC metrics to evaluate data quality before running cell QC
+
+``` {r plotting_qc}
+
+#Plotting mean transcript per cell per fov. 
+fov_positions <- fov_plotting(COSMX_INPUTFILES_REPO, obj)
+
+#Saving fov qc plots
+for (i in seq_along(fov_positions)) {
+  ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_fov_qc_plots_", names(fov_positions)[[i]], ".png"), plot = fov_positions[[i]], width = 10, height = 8, units = "in")
+}
+
+#Plotting mean transcript per cell per fov boxplots
+meantranscript_per_cell_per_fov_boxplot <- fov_box_plot(obj)
+ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_meantranscript_per_cell_per_fov_boxplot.png"), plot = meantranscript_per_cell_per_fov_boxplot, width = 10, height = 8, units = "in")
+
+#Plotting mean staining intensity by slide and marker
+staining_qc_plot <- staining_qc_plot(obj)
+ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_staining_qc_plot.png"), plot = staining_qc_plot, width = 10, height = 8, units = "in")
+
+#Creating a slide QC table summarizing key QC metrics for each slide. 
+qc_table <- slide_qc_table(obj, PANEL_PLEX, NEG_PANEL_PLEX)
+write.csv(qc_table, file = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_slide_qc_table.csv"), row.names = FALSE)
+
+
+```
+
+## Runing cell and FOV QC
+
+```{r cell_qc}
+
+obj <- computeFOVintegrity(obj, max_prop_loss = FOV_MAX_PROP_LOSS, panel_name = PANEL_FOV)
+obj <- computeSBR(obj)
+obj <- computeSplitRatio(obj)
+obj$SplitRatioToLocal_log2 <- log2(obj$SplitRatioToLocal)
+
+```
+
+## Plotting the QC results 
+
+```{r plotting_qc}
+# Raw QC scatter plots with thresholds
+plots <- plotQCs(
+  obj,
+  count_min       = COUNTS_THRESHOLD_MIN,
+  count_max       = COUNTS_THRESHOLD_MAX,
+  area_min        = AREA_THRESHOLD_MIN,
+  area_max        = AREA_THRESHOLD_MAX,
+  sbr_min         = SBR_THRESHOLD_MIN,
+  sbr_max         = SBR_THRESHOLD_MAX,
+  split_ratio_min = SPLIT_RATIO_THRESHOLD_MIN,
+  split_ratio_max = SPLIT_RATIO_THRESHOLD_MAX,
+  base_size = 15) %>%
+  patchwork::wrap_plots(nrow = 4)
+
+ggplot2::ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_qc_plots.png"), plot = plots, width = 10, height = 15, units = "in")
+
+```
+
+## FLagging cells based on the fov and cell QCs. 
+
+Notice that I am not removing cells, just flagging. 
+
+```{r flagging cells based on qc}
+
+obj <- qc_flagging(
+  obj,
+  count_min               = COUNTS_THRESHOLD_MIN,
+  count_max               = COUNTS_THRESHOLD_MAX,
+  area_min                = AREA_THRESHOLD_MIN,
+  area_max                = AREA_THRESHOLD_MAX,
+  fov_integrity_threshold = FOV_INTEGRITY_PERCENT_THRESHOLD,
+  sbr_min                 = SBR_THRESHOLD_MIN,
+  sbr_max                 = SBR_THRESHOLD_MAX,
+  split_ratio_min         = SPLIT_RATIO_THRESHOLD_MIN,
+  split_ratio_max         = SPLIT_RATIO_THRESHOLD_MAX)
+
+```
+
+
+## Removing flagged cells for downstream analysis
+
+In this section, I am subsetting the seurat object to only include cells with 'flag_overall' == FALSE
+
+``` {r removing flagged cells}
+
+#remove flagged cells
+obj <- subset(obj, obj$flag_overall == FALSE)
+obj
+
+```
+## Assingning patient IDs to each core
+
+In this section, I am using the `assignCoresToCells()` function to assing patient IDs 
+to each individual core. 
+
+At the end, I removed FOVs with mislabeled cells. I figured that it is easier to remove those 
+FOVs, rather than relabeling cells. 
+
+``` {r core_assignment}
+
+tma_map <- readxl::read_excel(path = Sys.getenv("tma_map_path"), sheet = "FT- OTHER CA TMA Map", col_names = FALSE)
+
+fov_positions <- read.csv(file = Sys.getenv("fov_positions_path"))
+
+tma_map <- as.matrix(tma_map)
+tma_map <- matrix(sub(",.*", "", tma_map), nrow = nrow(tma_map), ncol = ncol(tma_map))
+tma_map[tma_map == "" | tma_map == "NA" | tma_map == "NULL"] <- NA
+
+tma_map <- tma_map[nrow(tma_map):1, ] # flip rows to match TmaPlot orientation
+
+
+
+obj <- assignCoresToCells(obj = obj, tma_map = tma_map, fov_positions = fov_positions)
+
+tma_plot <- TmaPlot(obj, col.by = "sample_id_col", dark = F)
+ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_tma_sampleid.png"), plot = tma_plot, width = 8, height = 6, units = "in")
+
+#Filter TMA to remove mislabeled FOVs. 
+exclude_fov <- c(28, 29, 30, 67, 69, 70, 71, 77, 95, 108, 109, 110, 111, 113, 114, 
+                  241, 242, 243, 245, 246, 247, 248, 278, 279, 280, 281, 282, 283, 
+                  284, 285, 286, 331, 332, 333, 334, 335, 336, 337, 338, 339, 340)
+
+obj <- subset(obj, !(FOV %in% exclude_fov))
+
+```
+
+
+## Normalizing data with scPearsonPCA 
+
+Here, I am normalizing data with the scPearsonPCA package, which have proven 
+quite effective with CosMx data. 
+
+``` {r normalization with scPearsonPCA}
+
+obj <- scpearson_norm(obj, 
+                      assay = "RNA", 
+                      new.pca.name = "pearsonpca", 
+                      new.umap.name = "pearsonumap", 
+                      var_features = NULL) 
+
+obj <- FindNeighbors(obj, reduction = "pearsonumap", graph.name = "pearson_snn", k.param = 50, annoy.metric = "euclidean", dims = 1:2)
+
+obj <- FindClusters(obj, graph.name = "pearson_snn", cluster.name = "pearson_leiden",
+                                algorithm = 4, resolution = 0.1)  # Leiden = algorithm 4
+
+umap_leiden = DimPlot(obj, reduction = "pearsonumap", group.by = "pearson_leiden", label = TRUE, repel = TRUE)
+
+ggsave(filename = paste0(COSMX_OUTPUTFILES_REPO, "/", date, "_pearsonumap_leiden_tma.png"), plot = umap_leiden, width = 8, height = 6, units = "in")
+
+```
+
+
+## Normalizing data with scPearsonPCA and integrated batch correction
+
+``` {r normalization with scPearsonPCA and batch correction}
+
+obj <- scpearson_norm_batch(obj, 
+                            assay = "RNA", 
+                            new.pca.name = "pearsonpca_batch", 
+                            new.umap.name = "pearsonumap_batch", 
+                            var_features = NULL,
+                            batch = "sample_id_col")
+
+```
+
+
+## Decontamination with decontX
+
+``` {r decontX}
+
+obj <- decontx_fun(obj, 
+                  assay = "RNA", 
+                  layer = "counts", 
+                  labels = "pearson_leiden",
+                  new.assay.name = "decontx")
+
+```
+
+
+## Resegmentation with FastReseg
+
+``` {r fastreseg}
+
+#Flagging cells for resegmentation
+obj <- fastreseg_flag(obj, 
+                      input_dir = COSMX_INPUTFILES_REPO, 
+                      output_dir = COSMX_OUTPUTFILES_REPO, 
+                      cluster_col = "pearson_leiden")
+
+
+fastreseg_obj <- fastreseg_fullpipeline(obj, 
+                                        input_dir = COSMX_INPUTFILES_REPO, 
+                                        output_dir = COSMX_OUTPUTFILES_REPO, 
+                                        cluster_col = "pearson_leiden")
+
+
+```
+
+
+## Idetifying markers with HieraType
+
+```{r hieratype}
+
+heatmap <- hieratype_fun(obj, 
+                        assay = "RNA", 
+                        cluster.name = "pearson_leiden", 
+                        var_features = NULL)
+
+hm_rna <- HieraType::add_ncells(HieraType::marker_heatmap(heatmap, topn = 20)) + 
+  ggplot2::labs(title = "Heatmap")
+
+```
+
+
+## Tissue offsetting for despotX if analyzing multiple slides
+
+I need to offset tissue coordinates for each FOV so that they do not overlap during despotX analysis.
+
+```{r tissue_offsetting}
+
+obj <- tissue_offset(obj)
+
+```
+
+## h5ad conversion for despotx
+
+If you are working with multiple slides, ame sure you rum the tissue_offsetting function beforehand. 
+
+``` {r h5ad_conversion}
+
+# Wrappers for generating anndata object
+# ======================================
+python_anndata <- reticulate::import("anndata", convert = FALSE)
+python_pandas <- reticulate::import("pandas", convert = FALSE)
+
+# despotx's Python env (anndata 0.10.9) can't read the "nullable-string-array"
+# encoding pandas>=3.0/anndata>=0.13 use by default for string dtypes; force
+# plain object-dtype strings so the h5ad stays readable there.
+python_pandas$set_option("future.infer_string", FALSE)
+make_anndata <- function(X, obs, var, obsm = NULL) {
+  obs_names <- rownames(X); if (is.null(obs_names)) obs_names <- rownames(obs)
+  var_names <- colnames(X); if (is.null(var_names)) var_names <- rownames(var)
+  if (is.data.frame(obs)) rownames(obs) <- obs_names
+  if (is.data.frame(var)) rownames(var) <- var_names
+  X <- anndata:::.check_matrix(X)   # same matrix-conversion helper the package itself uses
+  ad <- python_anndata$AnnData(X = X, obs = obs, var = var, obsm = obsm)  # no dtype arg
+  anndata::AnnDataR6$new(ad)         # wrap back into the normal R6 object ($write_h5ad(), $X, etc.)
+}
+
+# Conversion of Seurat object into a h5ad object / file
+# =====================================================
+tc = counts_mat <- Matrix::t(obj[["RNA"]]$counts)
+
+# 2. Cell metadata — the column DeSpotX will condition on via --cell-type-col.
+# sample_id/fov/cell_id are carried through so downstream reclustering
+# (runScPearsonDimRed's batch correction) can run on despotx's Sherlock side
+# without needing to re-derive them from the original Seurat object.
+obs_df <- data.frame(
+  cluster   = as.character(obj$pearson_leiden),
+  cell_id   = as.character(obj$cell_ID),
+  sample_id = as.character(obj$slidename),
+  fov       = as.character(obj$fov),
+  row.names = colnames(obj)
+)
+
+# 3. Gene metadata — var_names only strictly required by DeSpotX.
+var_df <- data.frame(row.names = rownames(obj[["RNA"]]))
+
+# 4. Spatial coordinates — must be EXACTLY 2D (x, y).
+coords <- GetTissueCoordinates(obj, image = "all_slides")
+coords <- coords[match(colnames(obj), coords$cell), c("x", "y")]
+spatial_mat <- as.matrix(coords)
+
+# 5. Assemble....
+obj.adata <- make_anndata(
+  X    = counts_mat,
+  obs  = obs_df,
+  var  = var_df,
+  obsm = list(spatial = spatial_mat)
+)
+
+# 6. Force CSR before writing — via the raw Python object, not the R6 $X<- setter
+py_ad <- obj.adata$.get_py_object()
+sp <- reticulate::import("scipy.sparse", convert = FALSE)
+py_ad$X <- sp$csr_matrix(py_ad$X)
+
+# sanity check before writing
+cat("X format:", as.character(py_ad$X$format), "\n")   # should print "csr"
+cat("X shape:", paste(reticulate::py_to_r(py_ad$X$shape), collapse=" x "), "\n")
+
+# 7. Write directly from the raw python object (bypasses the R6 wrapper entirely).
+py_ad$write_h5ad(paste0(COSMX_OUTPUTFILES_REPO, date, "_output.h5ad"))
+
+```
+
+## Running despotX
+
+This line code has to be run on terminal. 
+
+```{r despotx}
+
+
+despotx --h5ad /input_h5ad_path --cell-type-col cluster --spatial-key spatial --out /output_path/ --device cuda
+
+```
+
+
+## Import h5ad object
+``` {r seurat_integration}
+library(Seurat)
+library(anndata)
+
+h5ad_tma <- read_h5ad(Sys.getenv(h5ad_path))
+
+
+# cells x genes (dgRMatrix) -> genes x cells (dgCMatrix), Seurat's expected orientation
+X <- as(h5ad_tma$X, "CsparseMatrix")
+rownames(X) <- rownames(h5ad_tma$obs)
+colnames(X) <- rownames(h5ad_tma$var)
+counts <- Matrix::t(X)
+
+# Integrate into Seurat object
+ft[["despotx"]] = Seurat::CreateAssayObject(counts)
+
+saveRDS(object = ft_tma, file = paste0(COSMX_OUTPUTFILES_REPO, Sys.Date(), "_ft_wholeslides_despotx.rds"))
+
+```
+
+
+## Differential Gene Expression
+
+```{r dge}
+
+de_results <- lmm_fun(obj = obj,
+                      assay = 'RNA', 
+                      condition_col = "cancer_status", 
+                      ref_condition = "early", 
+                      var_condition = "advanced", 
+                      donor_col = "slidename")
+```
+
+
